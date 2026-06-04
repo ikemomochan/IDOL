@@ -1,0 +1,66 @@
+# IDOL
+
+IDOL is a FastAPI web app for cutting idol dance videos into loopable practice sections.
+
+Upload a dance video, and the app detects beats and body keypoints, estimates motion amount, creates section boundaries, and lets you loop each section from a simple video UI.
+
+## Features
+
+- Upload a local dance video
+- Automatic pose tracking with YOLO pose models
+- Beat-aware section generation based on motion amount
+- Loop playback by section pins on the timeline
+- Playback speed, mirror mode, and bone-overlay mode
+- Simple UI focused on practice, with detailed count/metronome information hidden
+
+## Requirements
+
+- Python 3.10 or newer
+- ffmpeg
+- A machine that can run Ultralytics YOLO pose inference
+
+## Setup
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+On macOS/Linux, activate the virtual environment with:
+
+```bash
+source .venv/bin/activate
+```
+
+Install ffmpeg separately if it is not already available.
+
+Windows:
+
+```bash
+winget install Gyan.FFmpeg
+```
+
+macOS:
+
+```bash
+brew install ffmpeg
+```
+
+## Run
+
+```bash
+python app.py
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8000
+```
+
+## Notes
+
+- Generated analysis files are stored under `work/` and are not meant to be committed.
+- YOLO model weights (`*.pt`) are ignored by Git. Ultralytics can download the configured model when needed.
+- Start with short videos while testing, because pose inference can take time.

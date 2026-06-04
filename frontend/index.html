@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>IDOL 振り付け切り取り</title>
+  <link rel="stylesheet" href="/assets/styles.css?v=ui-lite-20260604" />
+</head>
+<body>
+  <main class="app-shell menu-visible" id="appShell">
+    <section class="video-stage" id="videoStage">
+      <video id="danceVideo" playsinline></video>
+
+      <label class="video-placeholder" id="videoPlaceholder" data-menu-control>
+        <input id="videoFile" type="file" accept="video/*" hidden />
+        <span class="placeholder-title">動画をアップロード</span>
+        <span class="placeholder-sub">振り付け動画を選ぶと、自動で区切りを解析します</span>
+      </label>
+
+      <div class="selected-clip-banner hidden" id="activeClipName" data-menu-control></div>
+
+      <div id="loadingOverlay" class="loading-overlay hidden" data-menu-control>
+        <div class="spinner"></div>
+        <div id="loadingText">解析中...</div>
+      </div>
+
+      <section class="top-actions overlay-ui" data-menu-control>
+        <label class="icon-btn upload-icon-btn" title="動画をアップロード" aria-label="動画をアップロード">
+          <span>＋</span>
+          <input id="videoFileMenu" type="file" accept="video/*" hidden />
+        </label>
+      </section>
+
+      <section class="bottom-panel overlay-ui" data-menu-control>
+        <div class="tab-options" id="tabOptions">
+          <div class="tab-pane active" data-pane="section">
+            <div class="timeline-section">
+              <div class="time-labels">
+                <span id="startTimeLabel">0:00</span>
+                <span id="endTimeLabel">0:00</span>
+              </div>
+              <div class="timeline" id="timeline">
+                <div class="rail"></div>
+                <div class="progress" id="progress"></div>
+                <div class="thumb" id="thumb"></div>
+                <div id="pinLayer"></div>
+              </div>
+            </div>
+
+            <div class="transport">
+              <button id="prevBtn" class="transport-btn" aria-label="前の区切り">⏮</button>
+              <button id="playBtn" class="transport-btn play" aria-label="再生">▶</button>
+              <button id="nextBtn" class="transport-btn" aria-label="次の区切り">⏭</button>
+            </div>
+
+            <div class="chunk-info hidden" id="chunkInfo"></div>
+          </div>
+
+          <div class="tab-pane" data-pane="cut">
+            <div class="option-title">振り付けの切り取り</div>
+            <div class="button-row three">
+              <button class="choice-btn detail-btn" data-detail="細かめ">細かめ</button>
+              <button class="choice-btn detail-btn active" data-detail="普通">普通</button>
+              <button class="choice-btn detail-btn" data-detail="粗め">粗め</button>
+            </div>
+          </div>
+
+          <div class="tab-pane" data-pane="speed">
+            <div class="option-title">スピード</div>
+            <div class="button-row three">
+              <button class="choice-btn speed-btn" data-rate="0.5">0.5</button>
+              <button class="choice-btn speed-btn" data-rate="0.75">0.75</button>
+              <button class="choice-btn speed-btn active" data-rate="1.0">1.0</button>
+            </div>
+          </div>
+
+          <div class="tab-pane" data-pane="mirror">
+            <div class="option-title">反転</div>
+            <div class="button-row two">
+              <button class="choice-btn mirror-btn" data-mirror="on">反転あり</button>
+              <button class="choice-btn mirror-btn active" data-mirror="off">反転なし</button>
+            </div>
+          </div>
+
+          <div class="tab-pane" data-pane="bone">
+            <div class="option-title">表示モード</div>
+            <div class="button-row two">
+              <button class="choice-btn view-mode-btn active" data-view-mode="normal" type="button">通常</button>
+              <button class="choice-btn view-mode-btn" data-view-mode="bone" type="button">ボーン</button>
+            </div>
+          </div>
+
+        </div>
+
+        <nav class="menu-tabs" aria-label="調整メニュー">
+          <button class="menu-tab active" data-tab="section" type="button">区間</button>
+          <button class="menu-tab" data-tab="cut" type="button">切り取り</button>
+          <button class="menu-tab" data-tab="speed" type="button">速度</button>
+          <button class="menu-tab" data-tab="mirror" type="button">反転</button>
+          <button class="menu-tab" data-tab="bone" type="button">ボーン</button>
+        </nav>
+      </section>
+
+      <section class="error-box hidden" id="errorBox" data-menu-control></section>
+    </section>
+  </main>
+
+  <div class="name-dialog-backdrop hidden" id="clipNameDialog" role="dialog" aria-modal="true" aria-labelledby="clipNameDialogTitle">
+    <div class="name-dialog">
+      <label class="name-dialog-title" id="clipNameDialogTitle" for="clipNameInput">クリップの名前を入力してください</label>
+      <input id="clipNameInput" class="name-input" type="text" maxlength="32" autocomplete="off" />
+      <div class="name-dialog-actions">
+        <button id="clipNameClearBtn" class="name-dialog-btn subtle" type="button">消す</button>
+        <button id="clipNameCancelBtn" class="name-dialog-btn" type="button">キャンセル</button>
+        <button id="clipNameSaveBtn" class="name-dialog-btn primary" type="button">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/assets/app.js?v=ui-lite-20260604"></script>
+</body>
+</html>
