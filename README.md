@@ -2,15 +2,16 @@
 
 IDOL is a FastAPI web app for cutting idol dance videos into loopable practice sections.
 
-Upload a dance video, and the app detects beats and body keypoints, estimates motion amount, creates section boundaries, and lets you loop each section from a simple video UI.
+Upload a dance video, and the app detects beats and body keypoints, groups similar bone movements into practice parts, and lets you loop each part from a simple video UI.
 
 ## Features
 
 - Upload a local dance video
 - Automatic pose tracking with YOLO pose models
-- Beat-aware section generation based on motion amount
+- Beat-aware section generation based on similar bone movement
 - Loop playback by section pins on the timeline
-- Playback speed, mirror mode, and bone-overlay mode
+- Playback speed and mirror mode
+- Fine / normal / rough part granularity controls
 - Simple UI focused on practice, with detailed count/metronome information hidden
 
 ## Requirements

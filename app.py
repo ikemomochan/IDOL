@@ -1,4 +1,4 @@
-# IDOL Motion-Balanced Chunking Prototype
+# IDOL Choreography-Part Chunking Prototype
 # Colab想定:
 # !pip -q install -U ultralytics opencv-python pandas tqdm librosa soundfile matplotlib gradio
 
@@ -23,6 +23,7 @@ from ultralytics import YOLO
 # =========================
 
 MODEL_NAME = "yolo11s-pose.pt"  # 軽量版。精度を上げたいなら yolo11s-pose.pt など
+CHUNK_END_EARLY_SEC = 0.4
 
 COCO_KP_NAMES = [
     "nose",
@@ -466,6 +467,446 @@ def aggregate_motion_by_count(count_df, motion_df):
     return out
 
 
+CHOREO_FEATURE_KPS = [
+    "nose",
+    "left_shoulder", "right_shoulder",
+    "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist",
+    "left_hip", "right_hip",
+    "left_knee", "right_knee",
+    "left_ankle", "right_ankle",
+]
+
+
+CHOREO_BONE_PAIRS = [
+    ("left_shoulder", "left_elbow"),
+    ("left_elbow", "left_wrist"),
+    ("right_shoulder", "right_elbow"),
+    ("right_elbow", "right_wrist"),
+    ("left_shoulder", "right_shoulder"),
+    ("left_hip", "right_hip"),
+    ("left_shoulder", "left_hip"),
+    ("right_shoulder", "right_hip"),
+    ("left_hip", "left_knee"),
+    ("left_knee", "left_ankle"),
+    ("right_hip", "right_knee"),
+    ("right_knee", "right_ankle"),
+]
+
+
+CHOREO_ANGLE_TRIPLES = [
+    ("left_shoulder", "left_elbow", "left_wrist"),
+    ("right_shoulder", "right_elbow", "right_wrist"),
+    ("left_elbow", "left_shoulder", "left_hip"),
+    ("right_elbow", "right_shoulder", "right_hip"),
+    ("left_shoulder", "left_hip", "left_knee"),
+    ("right_shoulder", "right_hip", "right_knee"),
+    ("left_hip", "left_knee", "left_ankle"),
+    ("right_hip", "right_knee", "right_ankle"),
+]
+
+
+def safe_feature_name(name):
+    return str(name).replace("_", "")
+
+
+def choreo_feature_columns():
+    cols = []
+    for kp_name in CHOREO_FEATURE_KPS:
+        safe_name = safe_feature_name(kp_name)
+        cols.extend([
+            f"pose_feat_{safe_name}_x",
+            f"pose_feat_{safe_name}_y",
+            f"pose_feat_{safe_name}_stdx",
+            f"pose_feat_{safe_name}_stdy",
+            f"pose_feat_{safe_name}_flowx",
+            f"pose_feat_{safe_name}_flowy",
+        ])
+
+    for a, b in CHOREO_BONE_PAIRS:
+        safe_name = f"{safe_feature_name(a)}_{safe_feature_name(b)}"
+        cols.extend([
+            f"pose_feat_bone_{safe_name}_dx",
+            f"pose_feat_bone_{safe_name}_dy",
+            f"pose_feat_bone_{safe_name}_stddx",
+            f"pose_feat_bone_{safe_name}_stddy",
+        ])
+
+    for a, b, c in CHOREO_ANGLE_TRIPLES:
+        safe_name = f"{safe_feature_name(a)}_{safe_feature_name(b)}_{safe_feature_name(c)}"
+        cols.extend([
+            f"pose_feat_angle_{safe_name}_cos",
+            f"pose_feat_angle_{safe_name}_sin",
+            f"pose_feat_angle_{safe_name}_stdcos",
+            f"pose_feat_angle_{safe_name}_stdsin",
+        ])
+
+    return cols
+
+
+def weighted_mean_std(values, weights):
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    if values.size == 0:
+        return 0.0, 0.0
+    weights = np.clip(weights, 0.01, None)
+    weight_sum = float(weights.sum())
+    mean = float((values * weights).sum() / weight_sum)
+    std = float(np.sqrt(((values - mean) ** 2 * weights).sum() / weight_sum))
+    return mean, std
+
+
+def angle_features(p1, p2, p3):
+    v1 = np.asarray(p1, dtype=float) - np.asarray(p2, dtype=float)
+    v2 = np.asarray(p3, dtype=float) - np.asarray(p2, dtype=float)
+    denom = float(np.linalg.norm(v1) * np.linalg.norm(v2))
+    if denom < 1e-9:
+        return None
+    cos_val = float(np.clip(np.dot(v1, v2) / denom, -1.0, 1.0))
+    sin_val = float(np.clip((v1[0] * v2[1] - v1[1] * v2[0]) / denom, -1.0, 1.0))
+    return cos_val, sin_val
+
+
+def normalized_frame_pose(frame_df, conf_th=0.3):
+    coords = {}
+    for _, r in frame_df.iterrows():
+        if float(r["conf"]) < conf_th:
+            continue
+        bbox_diag = max(float(r.get("bbox_diag", 1.0)), 1.0)
+        coords[str(r["kp_name"])] = (
+            (float(r["x"]) - float(r.get("bbox_cx", 0.0))) / bbox_diag,
+            (float(r["y"]) - float(r.get("bbox_cy", 0.0))) / bbox_diag,
+            float(r["conf"]),
+        )
+    return coords
+
+
+def build_choreo_feature_df(count_df, pose_df, target_track_id, conf_th=0.3):
+    """
+    カウントごとに、ボーンの形・角度・動き方向を特徴量化する。
+
+    座標は人物bboxの中心と対角長で正規化するため、ズームや立ち位置の差を少し抑えられる。
+    """
+    feature_cols = choreo_feature_columns()
+
+    if pose_df is None or pose_df.empty:
+        return pd.DataFrame([{col: 0.0 for col in feature_cols} for _ in range(len(count_df))])
+
+    track_df = pose_df[pose_df["track_id"] == int(target_track_id)].copy()
+    if track_df.empty:
+        return pd.DataFrame([{col: 0.0 for col in feature_cols} for _ in range(len(count_df))])
+
+    rows = []
+    for _, c in count_df.iterrows():
+        seg = track_df[
+            (track_df["time_sec"] >= float(c["start_sec"])) &
+            (track_df["time_sec"] < float(c["end_sec"]))
+        ].copy()
+
+        row = {col: 0.0 for col in feature_cols}
+        frame_poses = []
+        for _, frame_df in seg.groupby("frame_idx"):
+            coords = normalized_frame_pose(frame_df, conf_th=conf_th)
+            if coords:
+                frame_poses.append(coords)
+
+        if not frame_poses:
+            rows.append(row)
+            continue
+
+        for kp_name in CHOREO_FEATURE_KPS:
+            safe_name = safe_feature_name(kp_name)
+            visible = [pose[kp_name] for pose in frame_poses if kp_name in pose]
+
+            if not visible:
+                continue
+
+            xs = [v[0] for v in visible]
+            ys = [v[1] for v in visible]
+            weights = [v[2] for v in visible]
+            x_mean, x_std = weighted_mean_std(xs, weights)
+            y_mean, y_std = weighted_mean_std(ys, weights)
+            row[f"pose_feat_{safe_name}_x"] = x_mean
+            row[f"pose_feat_{safe_name}_y"] = y_mean
+            row[f"pose_feat_{safe_name}_stdx"] = x_std
+            row[f"pose_feat_{safe_name}_stdy"] = y_std
+
+            first = visible[0]
+            last = visible[-1]
+            row[f"pose_feat_{safe_name}_flowx"] = float(last[0] - first[0])
+            row[f"pose_feat_{safe_name}_flowy"] = float(last[1] - first[1])
+
+        for a, b in CHOREO_BONE_PAIRS:
+            safe_name = f"{safe_feature_name(a)}_{safe_feature_name(b)}"
+            vectors = []
+            weights = []
+            for pose in frame_poses:
+                if a not in pose or b not in pose:
+                    continue
+                ax, ay, aw = pose[a]
+                bx, by, bw = pose[b]
+                vectors.append((bx - ax, by - ay))
+                weights.append(min(aw, bw))
+
+            if not vectors:
+                continue
+
+            dx_mean, dx_std = weighted_mean_std([v[0] for v in vectors], weights)
+            dy_mean, dy_std = weighted_mean_std([v[1] for v in vectors], weights)
+            row[f"pose_feat_bone_{safe_name}_dx"] = dx_mean
+            row[f"pose_feat_bone_{safe_name}_dy"] = dy_mean
+            row[f"pose_feat_bone_{safe_name}_stddx"] = dx_std
+            row[f"pose_feat_bone_{safe_name}_stddy"] = dy_std
+
+        for a, b, c_name in CHOREO_ANGLE_TRIPLES:
+            safe_name = f"{safe_feature_name(a)}_{safe_feature_name(b)}_{safe_feature_name(c_name)}"
+            angles = []
+            weights = []
+            for pose in frame_poses:
+                if a not in pose or b not in pose or c_name not in pose:
+                    continue
+                angle = angle_features(pose[a][:2], pose[b][:2], pose[c_name][:2])
+                if angle is None:
+                    continue
+                angles.append(angle)
+                weights.append(min(pose[a][2], pose[b][2], pose[c_name][2]))
+
+            if not angles:
+                continue
+
+            cos_mean, cos_std = weighted_mean_std([v[0] for v in angles], weights)
+            sin_mean, sin_std = weighted_mean_std([v[1] for v in angles], weights)
+            row[f"pose_feat_angle_{safe_name}_cos"] = cos_mean
+            row[f"pose_feat_angle_{safe_name}_sin"] = sin_mean
+            row[f"pose_feat_angle_{safe_name}_stdcos"] = cos_std
+            row[f"pose_feat_angle_{safe_name}_stdsin"] = sin_std
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def attach_choreo_features(count_motion_df, count_df, pose_df, target_track_id):
+    out = count_motion_df.reset_index(drop=True).copy()
+    feature_df = build_choreo_feature_df(count_df.reset_index(drop=True), pose_df, target_track_id)
+    feature_df = feature_df.astype(float).fillna(0.0).reset_index(drop=True)
+    return pd.concat([out, feature_df], axis=1)
+
+
+def get_choreo_feature_matrix(count_motion_df):
+    feature_cols = [c for c in count_motion_df.columns if c.startswith("pose_feat_")]
+    if not feature_cols:
+        return None
+
+    x = count_motion_df[feature_cols].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy()
+    if x.size == 0:
+        return None
+
+    std = x.std(axis=0)
+    keep = std > 1e-6
+    if not np.any(keep):
+        return None
+
+    x = x[:, keep]
+    mean = x.mean(axis=0)
+    std = x.std(axis=0)
+    x = (x - mean) / np.clip(std, 1e-6, None)
+
+    # 1カウント単位のノイズを少し抑える
+    return pd.DataFrame(x).rolling(3, center=True, min_periods=1).mean().to_numpy()
+
+
+def normalize_scores(values):
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return values
+    lo = float(np.percentile(values, 10))
+    hi = float(np.percentile(values, 90))
+    if hi - lo < 1e-9:
+        return np.zeros_like(values)
+    return np.clip((values - lo) / (hi - lo), 0.0, 1.0)
+
+
+def choose_length_based_chunks(
+    count_motion_df,
+    target_counts_per_chunk=4,
+    min_counts_per_chunk=2,
+    max_counts_per_chunk=8,
+    nice_end_counts=(2, 4, 6, 8),
+):
+    """
+    ボーン特徴量が十分に取れない時のフォールバック。
+
+    運動量は分割条件に使わず、細かさ設定に応じたカウント数と
+    きりのいいカウント終端だけで分ける。
+    """
+    df = count_motion_df.reset_index(drop=True).copy()
+    n = len(df)
+    if n == 0:
+        return pd.DataFrame()
+
+    target_len = max(1, int(target_counts_per_chunk))
+    min_len = max(1, int(min_counts_per_chunk))
+    max_len = max(min_len, int(max_counts_per_chunk))
+
+    min_k = int(math.ceil(n / max_len))
+    max_k = max(1, int(math.floor(n / min_len)))
+    k = max(1, int(round(n / target_len)))
+    k = min(max(k, min_k), max_k)
+
+    total_motion = float(df["motion_sum"].sum()) if "motion_sum" in df.columns else 0.0
+    target_motion = total_motion / k if k > 0 else total_motion
+
+    INF = 10**18
+    dp = np.full((k + 1, n + 1), INF, dtype=float)
+    back = [[None for _ in range(n + 1)] for __ in range(k + 1)]
+    dp[0, 0] = 0.0
+
+    def seg_cost(i, j):
+        length = j - i
+        length_cost = ((length - target_len) / max(target_len, 1)) ** 2
+        end_count = int(df.iloc[j - 1]["count_in_eight"])
+        nice_cost = 0.0 if (end_count in nice_end_counts or j == n) else 0.25
+        return length_cost + nice_cost
+
+    for kk in range(1, k + 1):
+        for j in range(1, n + 1):
+            for i in range(max(0, j - max_len), j - min_len + 1):
+                if dp[kk - 1, i] >= INF:
+                    continue
+                cost = dp[kk - 1, i] + seg_cost(i, j)
+                if cost < dp[kk, j]:
+                    dp[kk, j] = cost
+                    back[kk][j] = i
+
+    if back[k][n] is None:
+        segments = []
+        start = 0
+        while start < n:
+            end = min(n, start + target_len)
+            if n - end and n - end < min_len:
+                end = n
+            segments.append((start, end))
+            start = end
+        return build_chunk_df(df, segments, target_motion, method="choreo_length")
+
+    segments = []
+    kk, j = k, n
+    while kk > 0:
+        i = back[kk][j]
+        if i is None:
+            break
+        segments.append((i, j))
+        j = i
+        kk -= 1
+    segments.reverse()
+
+    return build_chunk_df(df, segments, target_motion, method="choreo_length")
+
+
+def choose_choreo_part_chunks(
+    count_motion_df,
+    target_counts_per_chunk=4,
+    min_counts_per_chunk=2,
+    max_counts_per_chunk=8,
+    nice_end_counts=(2, 4, 6, 8),
+):
+    """
+    ボーン特徴量が似ているカウントを同じ振り付けパートとしてまとめる。
+
+    境界はカウント境界に限定し、区間内のボーン特徴のまとまりと、
+    前後の特徴変化が大きい境目を優先する。
+    """
+    df = count_motion_df.reset_index(drop=True).copy()
+    n = len(df)
+    if n == 0:
+        return pd.DataFrame()
+
+    features = get_choreo_feature_matrix(df)
+    if features is None or len(features) != n or n < 2:
+        return choose_length_based_chunks(
+            count_motion_df,
+            target_counts_per_chunk=target_counts_per_chunk,
+            min_counts_per_chunk=min_counts_per_chunk,
+            max_counts_per_chunk=max_counts_per_chunk,
+            nice_end_counts=nice_end_counts,
+        )
+
+    d = max(1, features.shape[1])
+    raw_change = np.linalg.norm(features[1:] - features[:-1], axis=1) / math.sqrt(d)
+    change_scores = normalize_scores(raw_change)
+    df["choreo_change_from_prev"] = np.r_[0.0, change_scores]
+
+    target_counts_per_chunk = max(1, int(target_counts_per_chunk))
+    min_len = max(1, int(min_counts_per_chunk))
+    max_len = max(min_len, int(max_counts_per_chunk))
+    k = max(1, int(round(n / target_counts_per_chunk)))
+    k = min(k, n)
+
+    total_motion = float(df["motion_sum"].sum())
+    target_motion = total_motion / k if k > 0 else total_motion
+
+    sum_prefix = np.vstack([np.zeros(d), np.cumsum(features, axis=0)])
+    sq_prefix = np.r_[0.0, np.cumsum(np.sum(features * features, axis=1))]
+
+    def segment_cohesion(i, j):
+        length = max(1, j - i)
+        s = sum_prefix[j] - sum_prefix[i]
+        sq = sq_prefix[j] - sq_prefix[i]
+        sse = max(0.0, float(sq - np.dot(s, s) / length))
+        return sse / (length * d)
+
+    def boundary_reward(j):
+        if j <= 0 or j >= n:
+            return 0.0
+        return float(change_scores[j - 1])
+
+    INF = 10**18
+    dp = np.full((k + 1, n + 1), INF, dtype=float)
+    back = [[None for _ in range(n + 1)] for __ in range(k + 1)]
+    dp[0, 0] = 0.0
+
+    def seg_cost(i, j):
+        length = j - i
+        cohesion_cost = segment_cohesion(i, j)
+        length_cost = 0.18 * ((length - target_counts_per_chunk) / max(target_counts_per_chunk, 1)) ** 2
+        end_count = int(df.iloc[j - 1]["count_in_eight"])
+        nice_cost = 0.0 if (end_count in nice_end_counts or j == n) else 0.2
+        return cohesion_cost + length_cost + nice_cost - (1.15 * boundary_reward(j))
+
+    for kk in range(1, k + 1):
+        for j in range(1, n + 1):
+            for i in range(max(0, j - max_len), j - min_len + 1):
+                if dp[kk - 1, i] >= INF:
+                    continue
+                cost = dp[kk - 1, i] + seg_cost(i, j)
+                if cost < dp[kk, j]:
+                    dp[kk, j] = cost
+                    back[kk][j] = i
+
+    if back[k][n] is None:
+        return choose_length_based_chunks(
+            count_motion_df,
+            target_counts_per_chunk=target_counts_per_chunk,
+            min_counts_per_chunk=min_counts_per_chunk,
+            max_counts_per_chunk=max_counts_per_chunk,
+            nice_end_counts=nice_end_counts,
+        )
+
+    segments = []
+    kk, j = k, n
+    while kk > 0:
+        i = back[kk][j]
+        if i is None:
+            break
+        segments.append((i, j))
+        j = i
+        kk -= 1
+    segments.reverse()
+
+    return build_chunk_df(df, segments, target_motion, method="choreo_similarity")
+
+
 def choose_motion_balanced_chunks(
     count_motion_df,
     target_counts_per_chunk=4,
@@ -598,12 +1039,15 @@ def greedy_chunks(
     return build_chunk_df(df, segments, target_motion)
 
 
-def build_chunk_df(count_df, segments, target_motion):
+def build_chunk_df(count_df, segments, target_motion, method="motion_balanced"):
     rows = []
     for chunk_id, (i, j) in enumerate(segments, start=1):
         seg = count_df.iloc[i:j]
         motion_sum = float(seg["motion_sum"].sum())
-        duration = float(seg["end_sec"].iloc[-1] - seg["start_sec"].iloc[0])
+        raw_start_sec = float(seg["start_sec"].iloc[0])
+        raw_end_sec = float(seg["end_sec"].iloc[-1])
+        end_sec = max(raw_start_sec + 0.05, raw_end_sec - CHUNK_END_EARLY_SEC)
+        duration = float(end_sec - raw_start_sec)
         density = motion_sum / max(duration, 1e-6)
 
         # 主に動いた部位
@@ -634,23 +1078,32 @@ def build_chunk_df(count_df, segments, target_motion):
             "chunk_id": chunk_id,
             "count_range": f"{int(seg['global_count'].iloc[0])}〜{int(seg['global_count'].iloc[-1])}",
             "count_in_eight_range": f"{int(seg['count_in_eight'].iloc[0])}〜{int(seg['count_in_eight'].iloc[-1])}",
-            "start_sec": round(float(seg["start_sec"].iloc[0]), 3),
-            "end_sec": round(float(seg["end_sec"].iloc[-1]), 3),
+            "start_sec": round(raw_start_sec, 3),
+            "end_sec": round(end_sec, 3),
+            "raw_end_sec": round(raw_end_sec, 3),
             "num_counts": int(len(seg)),
             "motion_sum": round(motion_sum, 5),
             "motion_load": load_label,
             "load_ratio": round(load_ratio, 3),
             "main_parts": part_text,
-            "reason": make_chunk_reason(seg, load_label),
+            "choreo_change": round(float(seg["choreo_change_from_prev"].iloc[0]), 3) if "choreo_change_from_prev" in seg.columns else 0.0,
+            "chunk_method": method,
+            "reason": make_chunk_reason(seg, load_label, method=method),
         })
 
     return pd.DataFrame(rows)
 
 
-def make_chunk_reason(seg, load_label):
+def make_chunk_reason(seg, load_label, method="motion_balanced"):
     top_parts = [p for p in seg["top_parts"].tolist() if isinstance(p, str) and p]
     main = top_parts[0] if top_parts else "身体全体"
     n = len(seg)
+    if method == "choreo_similarity":
+        if "choreo_change_from_prev" in seg.columns and float(seg["choreo_change_from_prev"].iloc[0]) >= 0.65:
+            return f"ボーンの動きが前のパートから大きく変わるため、{n}カウントを同じ振り付けパートとして分割。主に{main}が動く。"
+        return f"ボーンの形と動きが似ているため、{n}カウントを同じ振り付けパートとしてまとめて提示。"
+    if method == "choreo_length":
+        return f"ボーン特徴が少ないため、細かさ設定に合わせて{n}カウントを1パートとして提示。"
     if load_label == "高":
         return f"運動量が多いため、{n}カウントで短めに分割。主に{main}が動く。"
     if load_label == "低":
@@ -949,11 +1402,12 @@ def process_video_for_chunks(
 
     # 5) Count aggregation
     count_motion_df = aggregate_motion_by_count(count_df, motion_df)
+    count_motion_df = attach_choreo_features(count_motion_df, count_df, pose_df, chosen_track_id)
     count_motion_csv = str(Path(work_dir) / "count_motion.csv")
     count_motion_df.to_csv(count_motion_csv, index=False)
 
-    # 6) Motion-balanced chunking
-    chunk_df = choose_motion_balanced_chunks(
+    # 6) Choreo-part chunking
+    chunk_df = choose_choreo_part_chunks(
         count_motion_df,
         target_counts_per_chunk=int(target_counts_per_chunk),
         min_counts_per_chunk=int(min_counts_per_chunk),
@@ -1051,7 +1505,7 @@ def index():
 
 def detail_to_params(detail_level: str):
     if detail_level == "細かめ":
-        return dict(target_counts_per_chunk=2, min_counts_per_chunk=1, max_counts_per_chunk=4)
+        return dict(target_counts_per_chunk=3, min_counts_per_chunk=2, max_counts_per_chunk=6)
     if detail_level == "粗め":
         return dict(target_counts_per_chunk=8, min_counts_per_chunk=4, max_counts_per_chunk=16)
     return dict(target_counts_per_chunk=4, min_counts_per_chunk=2, max_counts_per_chunk=8)
@@ -1126,14 +1580,6 @@ def run_full_analysis(session_dir: Path, video_path: Path, detail_level: str):
     track_stats = rank_visible_tracks(pose_df)
     chosen_track_id = int(track_stats.iloc[0]["track_id"])
 
-    bone_video_path = session_dir / "bone_view.mp4"
-    bone_video_url = None
-    try:
-        if make_bone_view_video(str(video_path), pose_df, chosen_track_id, str(bone_video_path)):
-            bone_video_url = f"/work/{session_dir.name}/{bone_video_path.name}"
-    except Exception:
-        traceback.print_exc()
-
     motion_df = compute_frame_motion(
         pose_df,
         chosen_track_id,
@@ -1143,6 +1589,7 @@ def run_full_analysis(session_dir: Path, video_path: Path, detail_level: str):
     motion_df.to_csv(session_dir / "frame_motion.csv", index=False)
 
     count_motion_df = aggregate_motion_by_count(count_df, motion_df)
+    count_motion_df = attach_choreo_features(count_motion_df, count_df, pose_df, chosen_track_id)
     count_motion_df.to_csv(session_dir / "count_motion.csv", index=False)
 
     chunk_df = rechunk_from_count_motion(session_dir, detail_level)
@@ -1151,8 +1598,6 @@ def run_full_analysis(session_dir: Path, video_path: Path, detail_level: str):
         "session_id": session_dir.name,
         "video_filename": video_path.name,
         "video_url": f"/work/{session_dir.name}/{video_path.name}",
-        "bone_video_url": bone_video_url,
-        "bone_video_version": 4,
         "duration": info["duration"],
         "fps": info["fps"],
         "tempo": beat_info.get("tempo"),
@@ -1172,7 +1617,7 @@ def rechunk_from_count_motion(session_dir: Path, detail_level: str):
 
     count_motion_df = pd.read_csv(count_motion_path)
     params = detail_to_params(detail_level)
-    chunk_df = choose_motion_balanced_chunks(
+    chunk_df = choose_choreo_part_chunks(
         count_motion_df,
         target_counts_per_chunk=params["target_counts_per_chunk"],
         min_counts_per_chunk=params["min_counts_per_chunk"],
@@ -1235,6 +1680,10 @@ def reset_count1_for_session(session_dir: Path, count1_sec: float, detail_level:
 
     motion_df = pd.read_csv(motion_path)
     count_motion_df = aggregate_motion_by_count(count_df, motion_df)
+    pose_path = session_dir / "pose_keypoints.csv"
+    if pose_path.exists() and meta.get("chosen_track_id") is not None:
+        pose_df = pd.read_csv(pose_path)
+        count_motion_df = attach_choreo_features(count_motion_df, count_df, pose_df, int(meta["chosen_track_id"]))
     count_motion_df.to_csv(session_dir / "count_motion.csv", index=False)
     rechunk_from_count_motion(session_dir, detail_level)
 
@@ -1244,46 +1693,26 @@ def reset_count1_for_session(session_dir: Path, count1_sec: float, detail_level:
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def regenerate_bone_video_for_session(session_dir: Path):
-    meta_path = session_dir / "meta.json"
-    if not meta_path.exists():
-        raise RuntimeError("meta.jsonが見つかりません。先に動画を解析してください。")
+def apply_chunk_end_trim(chunk_df):
+    out = chunk_df.copy()
+    if out.empty or "start_sec" not in out.columns or "end_sec" not in out.columns:
+        return out
 
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    video_filename = meta.get("video_filename")
-    chosen_track_id = meta.get("chosen_track_id")
-    if not video_filename or chosen_track_id is None:
-        raise RuntimeError("ボーン表示に必要な解析情報が見つかりません。")
+    if "raw_end_sec" not in out.columns:
+        out["raw_end_sec"] = out["end_sec"].astype(float)
+        trimmed = out["raw_end_sec"].astype(float) - CHUNK_END_EARLY_SEC
+        min_end = out["start_sec"].astype(float) + 0.05
+        out["end_sec"] = np.maximum(min_end, trimmed)
 
-    video_path = session_dir / video_filename
-    pose_csv = session_dir / "pose_keypoints.csv"
-    if not video_path.exists() or not pose_csv.exists():
-        raise RuntimeError("ボーン表示に必要なファイルが見つかりません。")
-
-    bone_video_path = session_dir / "bone_view.mp4"
-    pose_df = pd.read_csv(pose_csv)
-    if not make_bone_view_video(str(video_path), pose_df, int(chosen_track_id), str(bone_video_path)):
-        raise RuntimeError("ボーン表示用動画を作成できませんでした。")
-
-    meta["bone_video_url"] = f"/work/{session_dir.name}/{bone_video_path.name}"
-    meta["bone_video_version"] = 4
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    return f"{meta['bone_video_url']}?v={int(bone_video_path.stat().st_mtime)}"
+    return out
 
 
 def build_response(session_dir: Path, detail_level: str):
     meta_path = session_dir / "meta.json"
     meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
 
-    if meta.get("bone_video_version") != 4 and meta.get("video_filename") and meta.get("chosen_track_id") is not None:
-        try:
-            regenerate_bone_video_for_session(session_dir)
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except Exception:
-            traceback.print_exc()
-
     count_motion_df = pd.read_csv(session_dir / "count_motion.csv")
-    chunk_df = pd.read_csv(session_dir / "chunks.csv")
+    chunk_df = apply_chunk_end_trim(pd.read_csv(session_dir / "chunks.csv"))
 
     # 表示に必要な列だけにする
     count_cols = [
@@ -1313,7 +1742,6 @@ def build_response(session_dir: Path, detail_level: str):
         "session_id": session_dir.name,
         "detail_level": detail_level,
         "video_url": versioned_work_url(meta.get("video_url")),
-        "bone_video_url": versioned_work_url(meta.get("bone_video_url")),
         "duration": meta.get("duration"),
         "tempo": meta.get("tempo"),
         "auto_beat_step": meta.get("auto_beat_step"),
@@ -1380,23 +1808,6 @@ async def set_count1(
     try:
         reset_count1_for_session(session_dir, count1_sec, detail_level)
         return JSONResponse(build_response(session_dir, detail_level))
-    except Exception as e:
-        traceback.print_exc()
-        return JSONResponse(
-            {"ok": False, "error": str(e)},
-            status_code=500,
-        )
-
-
-@app.post("/api/regenerate-bone/{session_id}")
-async def regenerate_bone(session_id: str):
-    session_dir = WORK_DIR / session_id
-    if not session_dir.exists():
-        raise HTTPException(status_code=404, detail="session not found")
-
-    try:
-        bone_video_url = regenerate_bone_video_for_session(session_dir)
-        return JSONResponse({"ok": True, "bone_video_url": bone_video_url})
     except Exception as e:
         traceback.print_exc()
         return JSONResponse(

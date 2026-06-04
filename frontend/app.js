@@ -14,8 +14,6 @@ const state = {
   menuVisible: true,
   activeTab: "section",
   originalVideoUrl: null,
-  boneVideoUrl: null,
-  viewMode: "normal",
 };
 
 const appShell = document.getElementById("appShell");
@@ -56,6 +54,8 @@ function removeLegacyCountUi() {
   document.getElementById("setCountOneBtn")?.remove();
   document.querySelector('[data-pane="metronome"]')?.remove();
   document.querySelector('[data-tab="metronome"]')?.remove();
+  document.querySelector('[data-pane="bone"]')?.remove();
+  document.querySelector('[data-tab="bone"]')?.remove();
 }
 
 function setMenuVisible(visible) {
@@ -99,84 +99,6 @@ function setVideoRate(rate) {
   if (!wasPaused) {
     playVideo();
   }
-}
-
-async function regenerateBoneVideo() {
-  if (!state.sessionId) return false;
-
-  const res = await fetch(`/api/regenerate-bone/${state.sessionId}`, {
-    method: "POST",
-  });
-  const data = await res.json();
-  if (!res.ok || !data.ok) {
-    throw new Error(data.error || "ボーン表示用の動画を作成できませんでした。");
-  }
-  state.boneVideoUrl = data.bone_video_url;
-  return true;
-}
-
-function setViewMode(mode, options = {}) {
-  const nextMode = mode === "bone" ? "bone" : "normal";
-  if (nextMode === "bone" && !state.boneVideoUrl) {
-    regenerateBoneVideo()
-      .then(() => setViewMode("bone", { retried: true }))
-      .catch(err => showError(err.message));
-    return;
-  }
-
-  const nextUrl = nextMode === "bone" ? state.boneVideoUrl : state.originalVideoUrl;
-  if (!nextUrl) {
-    state.viewMode = nextMode;
-    syncViewModeButtons();
-    return;
-  }
-  const nextHref = new URL(nextUrl, window.location.href).href;
-  if (video.currentSrc === nextHref || video.src === nextHref) {
-    state.viewMode = nextMode;
-    syncViewModeButtons();
-    return;
-  }
-
-  const currentTime = video.currentTime || 0;
-  const currentRate = video.playbackRate || 1;
-  const wasPaused = video.paused;
-
-  state.viewMode = nextMode;
-  syncViewModeButtons();
-
-  video.addEventListener("loadedmetadata", () => {
-    video.currentTime = Math.min(currentTime, Math.max(video.duration - 0.05, 0));
-    try {
-      video.defaultPlaybackRate = currentRate;
-      video.playbackRate = currentRate;
-    } catch (err) {
-      // 再生速度の復元に失敗しても表示切替は続ける。
-    }
-    if (!wasPaused) {
-      playVideo();
-    }
-    updateProgress();
-  }, { once: true });
-
-  video.addEventListener("error", () => {
-    if (nextMode === "bone" && !options.retried) {
-      regenerateBoneVideo()
-        .then(() => setViewMode("bone", { retried: true }))
-        .catch(err => showError(err.message));
-      return;
-    }
-    showError("ボーン表示用の動画を読み込めませんでした。");
-    setViewMode("normal", { retried: true });
-  }, { once: true });
-
-  video.src = nextUrl;
-  video.load();
-}
-
-function syncViewModeButtons() {
-  document.querySelectorAll(".view-mode-btn").forEach(btn => {
-    btn.classList.toggle("active", btn.dataset.viewMode === state.viewMode);
-  });
 }
 
 function startProgressMonitor() {
@@ -372,11 +294,8 @@ function applyAnalysisResult(data, options = {}) {
   state.activeChunkIndex = -1;
   state.loopEnabled = false;
   state.originalVideoUrl = data.video_url;
-  state.boneVideoUrl = data.bone_video_url || null;
 
   if (!options.keepVideo) {
-    state.viewMode = "normal";
-    syncViewModeButtons();
     video.src = state.originalVideoUrl;
     video.load();
     placeholder.classList.add("hidden");
@@ -577,12 +496,6 @@ document.querySelectorAll(".mirror-btn").forEach(btn => {
     document.querySelectorAll(".mirror-btn").forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     video.classList.toggle("mirrored", btn.dataset.mirror === "on");
-  });
-});
-
-document.querySelectorAll(".view-mode-btn").forEach(btn => {
-  btn.addEventListener("click", () => {
-    setViewMode(btn.dataset.viewMode);
   });
 });
 

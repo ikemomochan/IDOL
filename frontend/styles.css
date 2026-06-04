@@ -141,7 +141,7 @@ button {
   left: 50%;
   z-index: 18;
   width: min(640px, calc(100vw - 150px));
-  min-height: 48px;
+  min-height: 52px;
   transform: translateX(-50%);
   display: grid;
   place-items: center;
@@ -150,7 +150,7 @@ button {
   border-radius: 8px;
   background: #fff7d5;
   color: #101820;
-  font-size: clamp(17px, 2.2vw, 28px);
+  font-size: clamp(20px, 2.6vw, 32px);
   font-weight: 900;
   line-height: 1.18;
   text-align: center;
@@ -175,8 +175,8 @@ button {
 }
 
 .tab-options {
-  min-height: 118px;
-  padding: 12px 14px 10px;
+  min-height: 132px;
+  padding: 14px 16px 12px;
 }
 
 .tab-pane {
@@ -188,9 +188,9 @@ button {
 }
 
 .option-title {
-  margin-bottom: 12px;
+  margin-bottom: 14px;
   color: #101820;
-  font-size: 15px;
+  font-size: 18px;
   font-weight: 900;
   text-align: center;
 }
@@ -209,12 +209,12 @@ button {
 }
 
 .choice-btn {
-  min-height: 54px;
+  min-height: 60px;
   border: 2px solid var(--line);
   border-radius: 8px;
   background: #fff;
   color: #101820;
-  font-size: 18px;
+  font-size: 21px;
   font-weight: 900;
   cursor: pointer;
 }
@@ -246,20 +246,20 @@ button {
   display: flex;
   justify-content: space-between;
   color: #53616b;
-  font-size: 14px;
+  font-size: 16px;
   font-weight: 800;
 }
 
 .timeline {
   position: relative;
-  height: 50px;
+  height: 58px;
 }
 
 .rail,
 .progress {
   position: absolute;
   left: 14px;
-  top: 26px;
+  top: 31px;
   height: 8px;
   border-radius: 999px;
 }
@@ -280,10 +280,10 @@ button {
 .thumb {
   position: absolute;
   left: 14px;
-  top: 18px;
+  top: 21px;
   z-index: 5;
-  width: 24px;
-  height: 24px;
+  width: 28px;
+  height: 28px;
   transform: translateX(-50%);
   border: 2px solid #606b73;
   border-radius: 999px;
@@ -293,10 +293,14 @@ button {
 
 .pin {
   position: absolute;
-  top: -2px;
+  top: 1px;
   z-index: 3;
   transform: translateX(-50%);
-  font-size: 28px;
+  min-width: 24px;
+  min-height: 34px;
+  display: grid;
+  place-items: start center;
+  font-size: 21px;
   cursor: pointer;
   filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.45));
   user-select: none;
@@ -304,7 +308,7 @@ button {
 }
 
 .pin.active {
-  transform: translateX(-50%) scale(1.22);
+  transform: translateX(-50%) scale(1.12);
 }
 
 .pin-label {
@@ -341,24 +345,24 @@ button {
   display: flex;
   justify-content: center;
   align-items: center;
-  gap: 34px;
+  gap: 38px;
   margin-top: -2px;
 }
 
 .transport-btn {
-  min-width: 50px;
-  min-height: 40px;
+  min-width: 62px;
+  min-height: 48px;
   border: none;
   background: transparent;
   color: #101820;
-  font-size: 38px;
+  font-size: 42px;
   font-weight: 900;
   line-height: 1;
   cursor: pointer;
 }
 
 .transport-btn.play {
-  font-size: 48px;
+  font-size: 54px;
 }
 
 .chunk-info {
@@ -373,18 +377,18 @@ button {
 
 .menu-tabs {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   border-top: 2px solid var(--line);
   background: #f4f6f7;
 }
 
 .menu-tab {
-  min-height: 56px;
+  min-height: 62px;
   border: none;
   border-right: 2px solid var(--line);
   background: transparent;
   color: #101820;
-  font-size: 14px;
+  font-size: 16px;
   font-weight: 900;
   cursor: pointer;
 }
@@ -516,9 +520,10 @@ button {
 @media (max-width: 700px) {
   .selected-clip-banner {
     top: max(12px, env(safe-area-inset-top));
-    width: calc(100vw - 92px);
-    min-height: 42px;
-    padding: 7px 14px;
+    width: calc(100vw - 84px);
+    min-height: 46px;
+    padding: 8px 12px;
+    font-size: 20px;
   }
 
   .top-actions {
@@ -533,26 +538,40 @@ button {
   }
 
   .bottom-panel {
-    width: calc(100vw - 12px);
-    bottom: max(8px, env(safe-area-inset-bottom));
-    border-radius: 14px;
+    width: calc(100vw - 8px);
+    bottom: max(6px, env(safe-area-inset-bottom));
+    border-radius: 12px;
   }
 
   .tab-options {
-    min-height: 132px;
-    padding: 12px 10px 10px;
+    min-height: 150px;
+    padding: 14px 10px 12px;
+  }
+
+  .button-row {
+    gap: 8px;
+  }
+
+  .option-title {
+    font-size: 17px;
+  }
+
+  .timeline {
+    height: 60px;
   }
 
   .transport {
-    gap: 22px;
+    gap: 28px;
   }
 
   .transport-btn {
-    font-size: 32px;
+    min-width: 66px;
+    min-height: 50px;
+    font-size: 36px;
   }
 
   .transport-btn.play {
-    font-size: 42px;
+    font-size: 48px;
   }
 
   .chunk-info {
@@ -560,12 +579,12 @@ button {
   }
 
   .menu-tab {
-    min-height: 50px;
-    font-size: 12px;
+    min-height: 58px;
+    font-size: 14px;
   }
 
   .choice-btn {
-    min-height: 48px;
-    font-size: 16px;
+    min-height: 56px;
+    font-size: 18px;
   }
 }
