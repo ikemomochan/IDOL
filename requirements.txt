@@ -9,3 +9,5 @@ tqdm
 librosa
 soundfile
 matplotlib
+openai
+lap

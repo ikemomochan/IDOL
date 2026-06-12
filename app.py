@@ -5,6 +5,8 @@
 import os
 import cv2
 import math
+import re
+import base64
 import shutil
 import tempfile
 import subprocess
@@ -18,12 +20,37 @@ from tqdm import tqdm
 from ultralytics import YOLO
 
 
+def load_local_env(env_path):
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[7:].strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        value = value.strip().strip("'\"")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+load_local_env(Path(__file__).resolve().parent / ".env")
+
+
 # =========================
 # Constants
 # =========================
 
 MODEL_NAME = "yolo11s-pose.pt"  # 軽量版。精度を上げたいなら yolo11s-pose.pt など
-CHUNK_END_EARLY_SEC = 0.4
+CHUNK_END_EARLY_SEC = 0.2
+OPENAI_CHUNK_NAME_MODEL = os.getenv("OPENAI_CHUNK_NAME_MODEL", "gpt-5.4-mini")
+OPENAI_CHUNK_NAME_IMAGE_DETAIL = os.getenv("OPENAI_CHUNK_NAME_IMAGE_DETAIL", "high")
+OPENAI_CHUNK_NAME_MAX_CHARS = 18
 
 COCO_KP_NAMES = [
     "nose",
@@ -1212,6 +1239,120 @@ def make_chunk_contact_sheet(video_path, pose_df, target_track_id, chunk_df, mot
     return out_path
 
 
+def resize_frame_to_box(frame, box_w, box_h):
+    h, w = frame.shape[:2]
+    scale = min(box_w / max(w, 1), box_h / max(h, 1))
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    resized = cv2.resize(frame, (new_w, new_h))
+    canvas = np.ones((box_h, box_w, 3), dtype=np.uint8) * 18
+    x0 = (box_w - new_w) // 2
+    y0 = (box_h - new_h) // 2
+    canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+    return canvas
+
+
+def frame_idx_for_time(info, time_sec):
+    fps = float(info.get("fps") or 30)
+    total_frames = max(1, int(info.get("total_frames") or 1))
+    return int(np.clip(round(float(time_sec) * fps), 0, total_frames - 1))
+
+
+def chunk_naming_frame_points(info, motion_df, start_t, end_t):
+    duration = max(0.05, float(end_t) - float(start_t))
+    edge_offset = min(0.35, duration * 0.18)
+    start_time = float(start_t) + edge_offset
+    mid_time = float(start_t) + duration * 0.5
+    end_time = float(end_t) - edge_offset
+
+    seg_motion = motion_df[(motion_df["time_sec"] >= start_t) & (motion_df["time_sec"] < end_t)]
+    if len(seg_motion):
+        peak_time = float(seg_motion.sort_values("motion_smooth", ascending=False).iloc[0]["time_sec"])
+    else:
+        peak_time = float(start_t) + duration * 0.5
+
+    candidate_times = [
+        start_time,
+        float(start_t) + duration * 0.33,
+        mid_time,
+        peak_time,
+        float(start_t) + duration * 0.67,
+        end_time,
+    ]
+
+    used_frames = set()
+    out = []
+    for time_sec in sorted(candidate_times):
+        frame_idx = frame_idx_for_time(info, time_sec)
+        if frame_idx in used_frames:
+            continue
+        used_frames.add(frame_idx)
+        out.append((frame_idx, time_sec))
+        if len(out) == 4:
+            break
+
+    while len(out) < 4 and out:
+        frame_idx = int(np.clip(out[-1][0] + 1, 0, max(0, int(info.get("total_frames") or 1) - 1)))
+        if frame_idx in used_frames:
+            break
+        used_frames.add(frame_idx)
+        out.append((frame_idx, frame_idx / float(info.get("fps") or 30)))
+
+    return [(f"T{i + 1}", frame_idx, time_sec) for i, (frame_idx, time_sec) in enumerate(out)]
+
+
+def make_chunk_naming_sheet(video_path, chunk_df, motion_df, out_path):
+    """
+    VLM命名用に、各チャンクの開始・ピーク・終了フレームを1行に並べる。
+    1フレームだけだとポーズ名に寄りすぎるため、時系列の変化を見せる。
+    """
+    info = get_video_info(video_path)
+    box_w, box_h = 220, 170
+    label_w = 160
+    row_h = box_h + 40
+    cols = 4
+    sheet_w = label_w + cols * box_w
+    rows = []
+
+    for _, ch in chunk_df.iterrows():
+        start_t = float(ch["start_sec"])
+        end_t = float(ch.get("raw_end_sec", ch["end_sec"]))
+        row = np.ones((row_h, sheet_w, 3), dtype=np.uint8) * 245
+
+        chunk_id = int(ch["chunk_id"])
+        count_range = str(ch["count_range"]).replace("〜", "-")
+        load_label = {"高": "High", "中": "Mid", "低": "Low"}.get(str(ch["motion_load"]), str(ch["motion_load"]))
+        cv2.putText(row, f"Chunk {chunk_id}", (12, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (20, 20, 20), 2, cv2.LINE_AA)
+        cv2.putText(row, f"Count {count_range}", (12, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (35, 35, 35), 1, cv2.LINE_AA)
+        cv2.putText(row, f"{start_t:.2f}-{end_t:.2f}s", (12, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (35, 35, 35), 1, cv2.LINE_AA)
+        cv2.putText(row, f"Load {load_label}", (12, 124), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (35, 35, 35), 1, cv2.LINE_AA)
+
+        for col, (label, frame_idx, time_sec) in enumerate(chunk_naming_frame_points(info, motion_df, start_t, end_t)):
+            frame = read_frame(video_path, frame_idx)
+            if frame is None:
+                tile = np.ones((box_h, box_w, 3), dtype=np.uint8) * 30
+            else:
+                tile = resize_frame_to_box(frame, box_w, box_h)
+
+            x0 = label_w + col * box_w
+            row[0:box_h, x0:x0 + box_w] = tile
+            cv2.putText(row, f"{label} {time_sec:.2f}s", (x0 + 10, box_h + 27), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
+
+        rows.append(row)
+
+    if not rows:
+        return None
+
+    sheet = np.vstack(rows)
+    max_h = 5000
+    if sheet.shape[0] > max_h:
+        scale = max_h / sheet.shape[0]
+        sheet = cv2.resize(sheet, (max(1, int(sheet.shape[1] * scale)), max_h))
+
+    cv2.imwrite(out_path, sheet)
+    return out_path
+
+
 def make_bone_view_video(video_path, pose_df, target_track_id, out_path, conf_th=0.3):
     """
     選択されたtrack_idだけを白背景に描いた視聴用動画を作る。
@@ -1504,8 +1645,6 @@ def index():
 
 
 def detail_to_params(detail_level: str):
-    if detail_level == "細かめ":
-        return dict(target_counts_per_chunk=3, min_counts_per_chunk=2, max_counts_per_chunk=6)
     if detail_level == "粗め":
         return dict(target_counts_per_chunk=8, min_counts_per_chunk=4, max_counts_per_chunk=16)
     return dict(target_counts_per_chunk=4, min_counts_per_chunk=2, max_counts_per_chunk=8)
@@ -1551,6 +1690,160 @@ def maybe_adjust_beat_step(video_path, work_dir):
     return beat_info
 
 
+def image_file_to_data_url(image_path: Path):
+    ext = image_path.suffix.lower()
+    mime = "image/png" if ext == ".png" else "image/jpeg"
+    encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def sanitize_chunk_name(name):
+    name = str(name or "").strip()
+    name = re.sub(r"^(```json|```)|```$", "", name, flags=re.IGNORECASE).strip()
+    name = re.sub(r"^(chunk|clip|チャンク|クリップ|区間|パート)\s*\d+\s*[:：.\-、]*", "", name, flags=re.IGNORECASE).strip()
+    name = re.sub(r"\s+", " ", name)
+    return name[:OPENAI_CHUNK_NAME_MAX_CHARS]
+
+
+def parse_chunk_name_json(text):
+    text = str(text or "").strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+
+    if not text.lstrip().startswith("["):
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            text = text[start:end + 1]
+
+    data = json.loads(text)
+    items = data.get("chunks", data) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return {}
+
+    names = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        chunk_id = item.get("chunk_id")
+        name = sanitize_chunk_name(item.get("name"))
+        if chunk_id is None or not name:
+            continue
+        try:
+            names[int(chunk_id)] = name
+        except (TypeError, ValueError):
+            continue
+    return names
+
+
+def chunk_naming_prompt(chunk_df: pd.DataFrame):
+    chunks = []
+    for _, ch in chunk_df.iterrows():
+        chunks.append({
+            "chunk_id": int(ch["chunk_id"]),
+            "count_range": str(ch.get("count_range", "")),
+            "count_in_eight_range": str(ch.get("count_in_eight_range", "")),
+            "motion_load": str(ch.get("motion_load", "")),
+            "main_parts": str(ch.get("main_parts", "")),
+            "start_sec": float(ch.get("start_sec", 0)),
+            "end_sec": float(ch.get("end_sec", 0)),
+        })
+
+    return (
+        "あなたはアイドルダンスの練習アプリで、ループ区間に短い初期名を付けます。\n"
+        "添付画像は、各Chunkを1行ずつ並べたコンタクトシートです。"
+        "各行は左から右へ、同じチャンク内の時系列フレームです。\n"
+        "画像のポーズ変化を最優先し、下のメタ情報は補助として使ってください。\n\n"
+        "ルール:\n"
+        "- 1チャンクにつき1つ、2〜8文字程度の短い日本語名にする\n"
+        "- 「Chunk 1」「区間1」のような番号名は避ける\n"
+        "- 動作が直感的に理解できる名前を付ける\n"
+        "- 画像だけで分からない歌詞・感情・キャラ設定は推測しない\n"
+        "- 比喩やオノマトペを使ってもよい\n"
+        "- 不確かな場合は、最も目立つ腕・足・体向きの変化で名前を付ける\n"
+        "- 出力はJSONだけにする\n\n"
+        "出力形式:\n"
+        "{\"chunks\":[{\"chunk_id\":1,\"name\":\"腕振り\"}]}\n\n"
+        f"メタ情報:\n{json.dumps(chunks, ensure_ascii=False)}"
+    )
+
+
+def maybe_apply_openai_chunk_names(
+    session_dir: Path,
+    chunk_df: pd.DataFrame,
+    video_path: Path = None,
+    pose_df: pd.DataFrame = None,
+    motion_df: pd.DataFrame = None,
+    target_track_id=None,
+):
+    out = chunk_df.copy()
+    if out.empty:
+        return out
+    if not os.getenv("OPENAI_API_KEY"):
+        return out
+
+    try:
+        from openai import OpenAI
+
+        meta_path = session_dir / "meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+
+        if video_path is None and meta.get("video_filename"):
+            video_path = session_dir / meta["video_filename"]
+        if target_track_id is None:
+            target_track_id = meta.get("chosen_track_id")
+        if pose_df is None and (session_dir / "pose_keypoints.csv").exists():
+            pose_df = pd.read_csv(session_dir / "pose_keypoints.csv")
+        if motion_df is None and (session_dir / "frame_motion.csv").exists():
+            motion_df = pd.read_csv(session_dir / "frame_motion.csv")
+
+        if video_path is None or not Path(video_path).exists() or motion_df is None:
+            return out
+
+        sheet_path = session_dir / "chunk_name_contact_sheet.jpg"
+        make_chunk_naming_sheet(
+            str(video_path),
+            out,
+            motion_df,
+            str(sheet_path),
+        )
+        if not sheet_path.exists():
+            return out
+
+        client = OpenAI()
+        response = client.responses.create(
+            model=OPENAI_CHUNK_NAME_MODEL,
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": chunk_naming_prompt(out)},
+                    {"type": "input_image", "image_url": image_file_to_data_url(sheet_path), "detail": OPENAI_CHUNK_NAME_IMAGE_DETAIL},
+                ],
+            }],
+            temperature=0.2,
+            max_output_tokens=900,
+        )
+
+        names = parse_chunk_name_json(getattr(response, "output_text", ""))
+        if not names:
+            return out
+
+        out["name"] = out.get("name", "")
+        out["name_source"] = "openai_vlm"
+        for idx, ch in out.iterrows():
+            name = names.get(int(ch["chunk_id"]))
+            if name:
+                out.at[idx, "name"] = name
+        return out
+    except Exception as e:
+        try:
+            (session_dir / "chunk_name_error.txt").write_text(str(e)[:2000], encoding="utf-8")
+        except Exception:
+            pass
+        return out
+
+
 def run_full_analysis(session_dir: Path, video_path: Path, detail_level: str):
     info = get_video_info(str(video_path))
 
@@ -1592,7 +1885,14 @@ def run_full_analysis(session_dir: Path, video_path: Path, detail_level: str):
     count_motion_df = attach_choreo_features(count_motion_df, count_df, pose_df, chosen_track_id)
     count_motion_df.to_csv(session_dir / "count_motion.csv", index=False)
 
-    chunk_df = rechunk_from_count_motion(session_dir, detail_level)
+    chunk_df = rechunk_from_count_motion(
+        session_dir,
+        detail_level,
+        video_path=video_path,
+        pose_df=pose_df,
+        motion_df=motion_df,
+        target_track_id=chosen_track_id,
+    )
 
     meta = {
         "session_id": session_dir.name,
@@ -1610,7 +1910,14 @@ def run_full_analysis(session_dir: Path, video_path: Path, detail_level: str):
     return build_response(session_dir, detail_level)
 
 
-def rechunk_from_count_motion(session_dir: Path, detail_level: str):
+def rechunk_from_count_motion(
+    session_dir: Path,
+    detail_level: str,
+    video_path: Path = None,
+    pose_df: pd.DataFrame = None,
+    motion_df: pd.DataFrame = None,
+    target_track_id=None,
+):
     count_motion_path = session_dir / "count_motion.csv"
     if not count_motion_path.exists():
         raise RuntimeError("count_motion.csvが見つかりません。先に動画を解析してください。")
@@ -1623,6 +1930,14 @@ def rechunk_from_count_motion(session_dir: Path, detail_level: str):
         min_counts_per_chunk=params["min_counts_per_chunk"],
         max_counts_per_chunk=params["max_counts_per_chunk"],
         nice_end_counts=(2, 4, 6, 8),
+    )
+    chunk_df = maybe_apply_openai_chunk_names(
+        session_dir,
+        chunk_df,
+        video_path=video_path,
+        pose_df=pose_df,
+        motion_df=motion_df,
+        target_track_id=target_track_id,
     )
     chunk_df.to_csv(session_dir / "chunks.csv", index=False)
     return chunk_df
@@ -1681,11 +1996,19 @@ def reset_count1_for_session(session_dir: Path, count1_sec: float, detail_level:
     motion_df = pd.read_csv(motion_path)
     count_motion_df = aggregate_motion_by_count(count_df, motion_df)
     pose_path = session_dir / "pose_keypoints.csv"
+    pose_df = None
     if pose_path.exists() and meta.get("chosen_track_id") is not None:
         pose_df = pd.read_csv(pose_path)
         count_motion_df = attach_choreo_features(count_motion_df, count_df, pose_df, int(meta["chosen_track_id"]))
     count_motion_df.to_csv(session_dir / "count_motion.csv", index=False)
-    rechunk_from_count_motion(session_dir, detail_level)
+    rechunk_from_count_motion(
+        session_dir,
+        detail_level,
+        video_path=video_path,
+        pose_df=pose_df,
+        motion_df=motion_df,
+        target_track_id=meta.get("chosen_track_id"),
+    )
 
     meta["count1_sec"] = float(count1_sec)
     meta["snapped_count1"] = snapped_count1
